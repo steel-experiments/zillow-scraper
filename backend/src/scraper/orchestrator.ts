@@ -3,12 +3,13 @@ import {
   releaseSteelSession,
   SteelSession,
 } from "./steelClient";
-import { extractListingUrls, goToNextPage } from "./pageController";
+import { extractListingUrls, goToNextPage, buildNextPageUrl } from "./pageController";
 import { scrapeListingPage } from "./listingWorker";
 import { DynamicSchema } from "../schema/dynamicSchema";
 import { JobLogger } from "../logging/logger";
 
 const MAX_LISTINGS = 100;
+const BATCH_CONCURRENCY = 5;
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface ScrapeJob {
@@ -32,7 +33,7 @@ export function getJob(id: string): ScrapeJob | undefined {
  * 2. Extract listing URLs from search results page.
  * 3. Spawn concurrent workers for each listing (up to remaining count).
  * 4. Track global counter; stop at MAX_LISTINGS.
- * 5. Paginate if needed.
+ * 5. Paginate if needed (fresh session per page).
  */
 export async function startScrapeJob(
   jobId: string,
@@ -85,7 +86,7 @@ async function orchestrate(job: ScrapeJob, searchUrl: string): Promise<void> {
 
       logger.info(`--- Processing results page ${pageNum} ---`);
 
-      const listingUrls = await extractListingUrls(page);
+      const listingUrls = await extractListingUrls(mainSession.page, logger);
       logger.info(
         `Found ${listingUrls.length} listings on page ${pageNum}.`
       );
@@ -103,7 +104,7 @@ async function orchestrate(job: ScrapeJob, searchUrl: string): Promise<void> {
         `Scraping ${toScrape.length} listings (${globalCount}/${MAX_LISTINGS} done so far)...`
       );
 
-      // Launch concurrent workers for all listings on this page
+      // Launch workers in batches of BATCH_CONCURRENCY
       const results = await scrapeListingsBatch(
         toScrape,
         logger,
@@ -132,8 +133,17 @@ async function orchestrate(job: ScrapeJob, searchUrl: string): Promise<void> {
 
       if (globalCount >= MAX_LISTINGS) break;
 
-      // Try to go to next page
-      const hasNext = await goToNextPage(page, logger);
+      // Release the current main session before pagination
+      logger.info("Releasing main session before navigating to next page...");
+      await releaseSteelSession(mainSession);
+      mainSession = null;
+
+      // Create a fresh session for the next page (new proxy IP/fingerprint)
+      const nextPageUrl = buildNextPageUrl(searchUrl, pageNum + 1);
+      logger.info("Creating fresh session for next page...");
+      mainSession = await createSteelSession();
+
+      const hasNext = await goToNextPage(mainSession.page, nextPageUrl, logger);
       if (!hasNext) break;
       pageNum++;
     }
@@ -158,8 +168,9 @@ interface ScrapeResult {
 }
 
 /**
- * Scrape a batch of listings concurrently.
- * Respects abort signal and global limit — cancels pending work if limit reached.
+ * Scrape a batch of listings with limited concurrency.
+ * Processes workers in chunks of BATCH_CONCURRENCY to avoid
+ * opening too many simultaneous Steel sessions.
  */
 async function scrapeListingsBatch(
   urls: string[],
@@ -169,43 +180,52 @@ async function scrapeListingsBatch(
   maxCount: number
 ): Promise<ScrapeResult[]> {
   let completed = currentCount;
-  const results: ScrapeResult[] = [];
+  const allResults: ScrapeResult[] = [];
 
-  // Create a promise for each listing
-  const promises = urls.map(async (url, idx): Promise<ScrapeResult> => {
-    // Check if we should skip (global limit already reached)
-    if (completed >= maxCount || abortController.signal.aborted) {
-      return { url, success: false, error: "Skipped — limit reached" };
-    }
+  // Process in chunks of BATCH_CONCURRENCY
+  for (let i = 0; i < urls.length; i += BATCH_CONCURRENCY) {
+    if (completed >= maxCount || abortController.signal.aborted) break;
 
-    logger.info(`[Worker ${idx + 1}/${urls.length}] Starting: ${url}`);
+    const chunk = urls.slice(i, i + BATCH_CONCURRENCY);
+    logger.info(
+      `Processing batch ${Math.floor(i / BATCH_CONCURRENCY) + 1} (${chunk.length} workers)...`
+    );
 
-    try {
-      const data = await scrapeListingPage(url, logger);
+    const promises = chunk.map(async (url, idx): Promise<ScrapeResult> => {
+      const workerNum = i + idx + 1;
       if (completed >= maxCount || abortController.signal.aborted) {
-        return { url, success: false, error: "Skipped — limit reached mid-scrape" };
+        return { url, success: false, error: "Skipped — limit reached" };
       }
-      completed++;
-      return { url, success: true, data };
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      logger.error(`[Worker ${idx + 1}] Error scraping ${url}: ${msg}`);
-      return { url, success: false, error: msg };
-    }
-  });
 
-  const settled = await Promise.allSettled(promises);
-  for (const s of settled) {
-    if (s.status === "fulfilled") {
-      results.push(s.value);
-    } else {
-      results.push({
-        url: "unknown",
-        success: false,
-        error: s.reason?.message ?? String(s.reason),
-      });
+      logger.info(`[Worker ${workerNum}/${urls.length}] Starting: ${url}`);
+
+      try {
+        const data = await scrapeListingPage(url, logger);
+        if (completed >= maxCount || abortController.signal.aborted) {
+          return { url, success: false, error: "Skipped — limit reached mid-scrape" };
+        }
+        completed++;
+        return { url, success: true, data };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(`[Worker ${workerNum}] Error scraping ${url}: ${msg}`);
+        return { url, success: false, error: msg };
+      }
+    });
+
+    const settled = await Promise.allSettled(promises);
+    for (const s of settled) {
+      if (s.status === "fulfilled") {
+        allResults.push(s.value);
+      } else {
+        allResults.push({
+          url: "unknown",
+          success: false,
+          error: s.reason?.message ?? String(s.reason),
+        });
+      }
     }
   }
 
-  return results;
+  return allResults;
 }
